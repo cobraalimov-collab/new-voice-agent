@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AI Phone Agent</string>
+    <string name="accessibility_label">AI Phone Agent</string>
+    <string name="accessibility_description">Lets the AI Phone Agent read the screen and perform taps, typing, scrolling and navigation on your behalf when you give it a voice command.</string>
+</resources>
