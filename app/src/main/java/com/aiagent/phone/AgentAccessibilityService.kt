@@ -8,18 +8,31 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Base64
+import android.util.DisplayMetrics
+import android.view.Display
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.util.Locale
 import kotlin.coroutines.resume
+import kotlin.math.max
+import kotlin.math.min
 
 class AgentAccessibilityService : AccessibilityService() {
 
@@ -28,6 +41,9 @@ class AgentAccessibilityService : AccessibilityService() {
         var instance: AgentAccessibilityService? = null
 
         private const val MAX_NODES = 150
+        private const val MAX_SHOT_WIDTH = 720
+        private const val JPEG_QUALITY = 70
+        private const val MAX_HOLD_MS = 55000L
 
         private val ALIASES: List<Pair<String, List<String>>> = listOf(
             "telegram" to listOf("org.telegram.messenger", "org.telegram.messenger.web", "org.thunderdog.challegram"),
@@ -74,6 +90,22 @@ class AgentAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** Size of the last screenshot sent to the model, and screen-pixels per screenshot-pixel. */
+    @Volatile
+    var lastShotWidth = 0
+        private set
+
+    @Volatile
+    var lastShotHeight = 0
+        private set
+
+    @Volatile
+    var lastShotScale = 1f
+        private set
+
+    @Volatile
+    private var lastShotError = 0
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
@@ -97,14 +129,28 @@ class AgentAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    // ------------------------------------------------------------------ screen reading
+    /** Real full-screen size in pixels (includes status and navigation bars, like node bounds and screenshots). */
+    @Suppress("DEPRECATION")
+    private fun screenSize(): Pair<Int, Int> {
+        return try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val dm = DisplayMetrics()
+            wm.defaultDisplay.getRealMetrics(dm)
+            if (dm.widthPixels > 0 && dm.heightPixels > 0) dm.widthPixels to dm.heightPixels
+            else resources.displayMetrics.widthPixels to resources.displayMetrics.heightPixels
+        } catch (e: Exception) {
+            resources.displayMetrics.widthPixels to resources.displayMetrics.heightPixels
+        }
+    }
+
+    // ------------------------------------------------------------------ screen reading (UI tree)
 
     fun describeScreen(): String {
         val root = rootInActiveWindow
             ?: return "(screen not readable: no active window - it may be loading or a protected screen)"
-        val dm = resources.displayMetrics
+        val (w, h) = screenSize()
         val sb = StringBuilder()
-        sb.append("Screen ${dm.widthPixels}x${dm.heightPixels}, foreground package: ${root.packageName}\n")
+        sb.append("Screen ${w}x${h}, foreground package: ${root.packageName}\n")
         val counter = intArrayOf(0)
         walk(root, 0, sb, counter)
         if (counter[0] == 0) sb.append("(no readable nodes)\n")
@@ -128,6 +174,7 @@ class AgentAccessibilityService : AccessibilityService() {
                 val id = n.viewIdResourceName?.substringAfter('/') ?: ""
                 val flags = ArrayList<String>()
                 if (n.isClickable) flags.add("clickable")
+                if (n.isLongClickable) flags.add("long-clickable")
                 if (n.isEditable) flags.add("editable")
                 if (n.isScrollable) flags.add("scrollable")
                 if (n.isCheckable) flags.add(if (n.isChecked) "checked" else "checkable")
@@ -141,12 +188,112 @@ class AgentAccessibilityService : AccessibilityService() {
         }
     }
 
+    // ------------------------------------------------------------------ screenshot (visual eyes)
+
+    /**
+     * Takes a screenshot (Android 11+), scales it to max 720 px wide, JPEG 70 %, Base64 NO_WRAP.
+     * Returns null on Android < 11, on secure screens (banking, secret chats) or any failure.
+     * Requires android:canTakeScreenshot="true" in accessibility_service_config.xml.
+     */
+    suspend fun captureScreenBase64(): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        for (attempt in 0..1) {
+            lastShotError = 0
+            val bmp = withTimeoutOrNull(4000L) { takeScreenshotBitmap() }
+            if (bmp != null) {
+                return withContext(Dispatchers.Default) { encodeJpeg(bmp) }
+            }
+            // Error 3 = screenshots requested too often (min ~333 ms apart): wait and retry once.
+            if (lastShotError == 3 && attempt == 0) {
+                delay(450)
+                continue
+            }
+            break
+        }
+        return null
+    }
+
+    private suspend fun takeScreenshotBitmap(): Bitmap? = suspendCancellableCoroutine { cont ->
+        try {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        var soft: Bitmap? = null
+                        val buffer = result.hardwareBuffer
+                        try {
+                            val hw = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
+                            if (hw != null) {
+                                soft = hw.copy(Bitmap.Config.ARGB_8888, false)
+                                hw.recycle()
+                            }
+                        } catch (e: Throwable) {
+                            AgentLog.add("ERROR", "Screenshot conversion failed: ${e.javaClass.simpleName}")
+                        } finally {
+                            try {
+                                buffer.close()
+                            } catch (ignored: Exception) {
+                            }
+                        }
+                        if (cont.isActive) cont.resume(soft) else soft?.recycle()
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        lastShotError = errorCode
+                        val why = when (errorCode) {
+                            1 -> "internal error"
+                            2 -> "no screenshot permission (add canTakeScreenshot to accessibility config, then re-enable the service)"
+                            3 -> "requested too often"
+                            4 -> "invalid display"
+                            5 -> "invalid window"
+                            6 -> "secure screen (app blocks screenshots)"
+                            else -> "code $errorCode"
+                        }
+                        if (errorCode != 3) AgentLog.add("ERROR", "Screenshot failed: $why")
+                        if (cont.isActive) cont.resume(null)
+                    }
+                }
+            )
+        } catch (e: Throwable) {
+            AgentLog.add("ERROR", "takeScreenshot crashed: ${e.javaClass.simpleName}: ${e.message}")
+            if (cont.isActive) cont.resume(null)
+        }
+    }
+
+    /** Scales + compresses, recycling every bitmap it touches (including [src]). */
+    private fun encodeJpeg(src: Bitmap): String? {
+        var scaled: Bitmap? = null
+        try {
+            val w = src.width
+            val h = src.height
+            if (w <= 0 || h <= 0) return null
+            val targetW = min(MAX_SHOT_WIDTH, w)
+            val targetH = max(1, (h.toLong() * targetW / w).toInt())
+            val s = if (targetW == w) src else Bitmap.createScaledBitmap(src, targetW, targetH, true)
+            scaled = s
+            val bos = ByteArrayOutputStream(96 * 1024)
+            if (!s.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, bos)) return null
+            lastShotWidth = targetW
+            lastShotHeight = targetH
+            lastShotScale = w.toFloat() / targetW.toFloat()
+            return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+        } catch (e: Throwable) {
+            AgentLog.add("ERROR", "Screenshot encode failed: ${e.javaClass.simpleName}")
+            return null
+        } finally {
+            val s = scaled
+            if (s != null && s !== src) s.recycle()
+            src.recycle()
+        }
+    }
+
     // ------------------------------------------------------------------ actions
 
-    suspend fun execute(cmd: JSONObject): String {
+    suspend fun execute(cmd: JSONObject, lang: AppLang = Prefs.getLang(this)): String {
         return try {
             when (val a = cmd.optString("action").lowercase(Locale.ROOT)) {
-                "open_app" -> openApp(cmd.optString("app"))
+                "open_app" -> openApp(cmd.optString("app").ifBlank { cmd.optString("package") })
                 "tap_xy" -> {
                     if (!cmd.has("x") || !cmd.has("y")) "failed: tap_xy needs x and y"
                     else {
@@ -156,6 +303,9 @@ class AgentAccessibilityService : AccessibilityService() {
                     }
                 }
                 "tap_text" -> tapText(cmd.optString("text"))
+                "long_click", "long_press" -> longClick(cmd)
+                "hold" -> if (cmd.optString("message").isNotBlank()) holdAndSpeak(cmd, lang) else longClick(cmd)
+                "hold_and_speak", "voice_message" -> holdAndSpeak(cmd, lang)
                 "type_text" -> typeText(cmd.optString("text"), cmd.optBoolean("enter", false))
                 "scroll" -> scroll(cmd.optString("direction", "down"))
                 "back" -> if (performGlobalAction(GLOBAL_ACTION_BACK)) "back pressed" else "failed: back"
@@ -194,17 +344,23 @@ class AgentAccessibilityService : AccessibilityService() {
             if (!started && cont.isActive) cont.resume(false)
         }
 
-    private suspend fun tap(x: Int, y: Int): Boolean {
-        val dm = resources.displayMetrics
+    private fun pointPath(x: Int, y: Int): Path {
+        val (w, h) = screenSize()
         val path = Path()
-        path.moveTo(x.coerceIn(1, dm.widthPixels - 1).toFloat(), y.coerceIn(1, dm.heightPixels - 1).toFloat())
-        return dispatchPath(path, 60)
+        path.moveTo(x.coerceIn(1, w - 1).toFloat(), y.coerceIn(1, h - 1).toFloat())
+        return path
     }
 
+    private suspend fun tap(x: Int, y: Int): Boolean = dispatchPath(pointPath(x, y), 60)
+
+    /** Finger down at (x,y), held still for [ms], then released. */
+    private suspend fun holdAt(x: Int, y: Int, ms: Long): Boolean =
+        dispatchPath(pointPath(x, y), ms.coerceIn(50L, MAX_HOLD_MS))
+
     private suspend fun scroll(direction: String): String {
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels.toFloat()
-        val h = dm.heightPixels.toFloat()
+        val (wi, hi) = screenSize()
+        val w = wi.toFloat()
+        val h = hi.toFloat()
         val up = direction.equals("up", ignoreCase = true)
         // "down" = reveal content below -> finger swipes upwards
         val y1 = if (up) h * 0.30f else h * 0.70f
@@ -241,17 +397,92 @@ class AgentAccessibilityService : AccessibilityService() {
         for (i in 0 until n.childCount) collect(n.getChild(i), q, depth + 1, exact, partial)
     }
 
-    private suspend fun tapText(text: String): String {
+    private fun findNodeByText(text: String): AccessibilityNodeInfo? {
         val q = text.trim().lowercase(Locale.ROOT)
-        if (q.isEmpty()) return "failed: tap_text needs text"
-        val root = rootInActiveWindow ?: return "failed: no active window"
+        if (q.isEmpty()) return null
+        val root = rootInActiveWindow ?: return null
         val exact = ArrayList<AccessibilityNodeInfo>()
         val partial = ArrayList<AccessibilityNodeInfo>()
         collect(root, q, 0, exact, partial)
-        val target = exact.firstOrNull()
+        return exact.firstOrNull()
             ?: partial.minByOrNull { (it.text?.length ?: it.contentDescription?.length ?: 0) }
-            ?: return "failed: no visible element matching \"$text\""
+    }
+
+    private suspend fun tapText(text: String): String {
+        if (text.isBlank()) return "failed: tap_text needs text"
+        if (rootInActiveWindow == null) return "failed: no active window"
+        val target = findNodeByText(text) ?: return "failed: no visible element matching \"$text\""
         return if (clickNode(target)) "tapped \"$text\"" else "failed: could not click \"$text\""
+    }
+
+    /** Target point from "x"/"y", or from the center of the element matching "text". */
+    private fun resolvePoint(cmd: JSONObject): Pair<Int, Int>? {
+        if (cmd.has("x") && cmd.has("y")) return cmd.optInt("x") to cmd.optInt("y")
+        val text = cmd.optString("text")
+        if (text.isBlank()) return null
+        val node = findNodeByText(text) ?: return null
+        val r = Rect()
+        node.getBoundsInScreen(r)
+        return if (r.isEmpty) null else r.centerX() to r.centerY()
+    }
+
+    private suspend fun longClick(cmd: JSONObject): String {
+        val ms = cmd.optLong("ms", 800L).coerceIn(400L, 10000L)
+        // Default-length long press on a text target: try the accessibility action first.
+        if (!cmd.has("x") && ms <= 1000L) {
+            val text = cmd.optString("text")
+            if (text.isNotBlank()) {
+                var cur: AccessibilityNodeInfo? = findNodeByText(text)
+                var hops = 0
+                while (cur != null && hops < 7) {
+                    if (cur.isLongClickable && cur.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)) {
+                        return "long-clicked \"$text\""
+                    }
+                    cur = cur.parent
+                    hops++
+                }
+            }
+        }
+        val pt = resolvePoint(cmd) ?: return "failed: long_click needs x,y or a visible text"
+        return if (holdAt(pt.first, pt.second, ms)) "long-pressed (${pt.first},${pt.second}) for ${ms}ms"
+        else "failed: long-press gesture rejected"
+    }
+
+    private suspend fun speakAndWait(text: String, lang: AppLang, timeoutMs: Long): Boolean {
+        val finished = withTimeoutOrNull(timeoutMs) {
+            suspendCancellableCoroutine<Unit> { cont ->
+                TtsManager.speak(text, lang) { if (cont.isActive) cont.resume(Unit) }
+            }
+            true
+        }
+        return finished == true
+    }
+
+    /**
+     * Voice message: press and hold (x,y) - e.g. Telegram's microphone button - while the
+     * TTS voice speaks [message]; releasing the finger sends the recording.
+     */
+    private suspend fun holdAndSpeak(cmd: JSONObject, lang: AppLang): String {
+        val message = cmd.optString("message").ifBlank { cmd.optString("speech") }.trim()
+        if (message.isEmpty()) return "failed: hold_and_speak needs \"message\""
+        val pt = resolvePoint(cmd) ?: return "failed: hold_and_speak needs x,y (or ix,iy) of the mic button"
+
+        // Estimated speaking time + margin so the end of the sentence is not cut off.
+        val speechMs = (message.length * 85L + 1500L).coerceIn(2500L, MAX_HOLD_MS - 2000L)
+        val holdMs = (speechMs + 1400L).coerceAtMost(MAX_HOLD_MS)
+        AgentLog.add("ACTION", "Holding (${pt.first},${pt.second}) ${holdMs}ms and speaking: ${message.take(60)}")
+
+        return coroutineScope {
+            val gesture = async { holdAt(pt.first, pt.second, holdMs) }
+            delay(700) // give the app time to start recording
+            val spoke = speakAndWait(message, lang, holdMs + 3000L)
+            val held = gesture.await()
+            when {
+                !held -> "failed: hold gesture was interrupted (recording may be cancelled)"
+                !spoke -> "held mic ${holdMs}ms and released (TTS did not report completion)"
+                else -> "held mic ${holdMs}ms while speaking, then released (voice message should be sent)"
+            }
+        }
     }
 
     private fun findEditable(n: AccessibilityNodeInfo?, depth: Int): AccessibilityNodeInfo? {
