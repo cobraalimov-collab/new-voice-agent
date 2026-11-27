@@ -1,6 +1,7 @@
 package com.aiagent.phone
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,27 +11,51 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Foreground service: continuous wake-word listening + autonomous task execution.
- * Everything touching SpeechRecognizer happens on the main thread.
+ *
+ * Ears = AudioRecord (16 kHz mono PCM16) + energy VAD on Dispatchers.IO.
+ * Each detected utterance is wrapped in a WAV header and transcribed by Groq Whisper
+ * (whisper-large-v3-turbo, no fixed language -> Uzbek/English/Russian code-switching works).
+ * The microphone is released whenever the agent is BUSY (speaking or acting) so it never hears itself.
  */
 class AgentService : Service() {
 
@@ -39,7 +64,36 @@ class AgentService : Service() {
         const val ACTION_STOP = "com.aiagent.phone.STOP"
         private const val CHANNEL_ID = "agent_listening"
         private const val NOTIF_ID = 1001
-        private val WAKE_WORDS = listOf("agent", "агент", "yordamchi")
+        private val WAKE_WORDS = listOf("agent", "агент", "yordamchi", "ёрдамчи")
+
+        // ---- audio / VAD ----
+        private const val SAMPLE_RATE = 16000
+        private const val FRAME_SAMPLES = 512                       // 32 ms per frame
+        private const val FRAME_MS = FRAME_SAMPLES * 1000 / SAMPLE_RATE
+        private const val VAD_THRESHOLD = 1100                      // base amplitude threshold
+        private const val VAD_MAX_THRESHOLD = 6000                  // cap for the adaptive threshold
+        private const val START_FRAMES = 2                          // loud frames in a row to start
+        private const val PRE_ROLL_FRAMES = 10                      // ~320 ms kept before speech start
+        private const val MIN_SPEECH_MS = 250                       // shorter = click/bump, ignored
+        private const val WAKE_SILENCE_MS = 900
+        private const val COMMAND_SILENCE_MS = 1300
+        private const val WAKE_MAX_MS = 5000
+        private const val COMMAND_MAX_MS = 12000
+        private const val COMMAND_WAIT_MS = 8000                    // no speech in COMMAND mode -> back to WAKE
+
+        // ---- Groq Whisper ----
+        private const val GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+        private const val GROQ_MODEL = "whisper-large-v3-turbo"
+        private const val WHISPER_PROMPT =
+            "O'zbekcha va inglizcha buyruqlar: Yordamchi, Agent, Telegramga kir, USDT sotib ol, ovozli xabar yubor."
+
+        /** Exact (normalized) phrases Whisper invents on silence/noise. */
+        private val HALLUCINATIONS = setOf(
+            "thank you", "thank you very much", "thanks", "thanks for watching", "thank you for watching",
+            "you", "bye", "bye bye", "okay", "music", "applause", "subscribe", "like and subscribe",
+            "спасибо", "спасибо за внимание", "спасибо за просмотр", "продолжение следует", "до свидания",
+            "музыка", "rahmat", "katta rahmat"
+        )
 
         @Volatile
         var running = false
@@ -56,16 +110,31 @@ class AgentService : Service() {
 
     private enum class Mode { WAKE, COMMAND, BUSY }
 
+    private sealed class Capture {
+        class Speech(val pcm: ByteArray, val durationMs: Int) : Capture()
+        object NoSpeech : Capture()
+        object Aborted : Capture()
+        object RecorderFailed : Capture()
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var job: Job? = null
-    private var recognizer: SpeechRecognizer? = null
+    private var listenJob: Job? = null
+
+    @Volatile
     private var mode = Mode.WAKE
-    private var commandMisses = 0
     private var wakeLock: PowerManager.WakeLock? = null
     private var started = false
 
-    private val restartRunnable = Runnable { startListening() }
+    /** Adaptive noise floor (only touched on the IO listening coroutine). */
+    private var noiseFloor = 0.0
+
+    private val http: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -88,10 +157,18 @@ class AgentService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        if (Prefs.getGroqKey(this).isBlank()) {
+            AgentLog.add(
+                "ERROR",
+                "Groq key (gsk_...) not found. Paste it into the API key field together with the brain key, separated by a comma."
+            )
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         running = true
         acquireWakeLock()
-        AgentLog.add("SYS", "Listening service started")
+        AgentLog.add("SYS", "Listening service started (Groq $GROQ_MODEL)")
         mode = Mode.WAKE
         startListening()
         return START_NOT_STICKY
@@ -124,7 +201,7 @@ class AgentService : Service() {
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             AgentLog.add("ERROR", "RECORD_AUDIO not granted")
-            // still must satisfy startForegroundService contract; try plain foreground, ignore failure
+            // still must satisfy the startForegroundService contract; try plain foreground, ignore failure
             return try {
                 startForeground(NOTIF_ID, notification)
                 false
@@ -162,136 +239,340 @@ class AgentService : Service() {
         }
     }
 
-    // ------------------------------------------------------------------ recognizer
+    // ------------------------------------------------------------------ listening control (main thread)
 
-    private fun scheduleRestart(delayMs: Long) {
-        main.removeCallbacks(restartRunnable)
-        main.postDelayed(restartRunnable, delayMs)
-    }
-
-    private fun stopRecognizer() {
-        main.removeCallbacks(restartRunnable)
-        val r = recognizer
-        recognizer = null
-        if (r != null) {
-            try {
-                r.cancel()
-            } catch (_: Exception) {
-            }
-            try {
-                r.destroy()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
+    /** (Re)starts the IO listening loop. The previous loop is fully stopped first so only one AudioRecord records. */
     private fun startListening() {
         if (!running || mode == Mode.BUSY) return
-        main.removeCallbacks(restartRunnable)
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            AgentLog.add("ERROR", "No speech recognition service on this phone (install/enable the Google app / Speech Services). Retrying in 5s")
-            scheduleRestart(5000)
+        val prev = listenJob
+        listenJob = scope.launch(Dispatchers.IO) {
+            prev?.cancelAndJoin()
+            listenLoop()
+        }
+    }
+
+    private fun stopListening() {
+        listenJob?.cancel()
+    }
+
+    // ------------------------------------------------------------------ audio loop (IO thread)
+
+    @SuppressLint("MissingPermission")
+    private suspend fun listenLoop() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            AgentLog.add("ERROR", "Microphone permission missing - stopping")
+            withContext(Dispatchers.Main) { stopSelf() }
             return
         }
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) {
+            AgentLog.add("ERROR", "This device does not support 16 kHz mono recording (minBuffer=$minBuf)")
+            return
+        }
+        val bufBytes = max(minBuf, SAMPLE_RATE * 2) // ~1 s internal buffer
+
+        while (currentCoroutineContext().isActive && running && mode != Mode.BUSY) {
+            val rec: AudioRecord? = try {
+                AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufBytes
+                )
+            } catch (e: Exception) {
+                AgentLog.add("ERROR", "AudioRecord create failed: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+            if (rec == null || rec.state != AudioRecord.STATE_INITIALIZED) {
+                try {
+                    rec?.release()
+                } catch (ignored: Exception) {
+                }
+                AgentLog.add("ERROR", "Microphone unavailable (used by a call or another app?) - retrying in 2 s")
+                delay(2000)
+                continue
+            }
+
+            var recorderFailed = false
+            try {
+                AgentLog.add("MIC", "Microphone open (${mode.name} mode, VAD threshold $VAD_THRESHOLD)")
+                while (currentCoroutineContext().isActive && running && mode != Mode.BUSY) {
+                    val captureMode = mode
+                    when (val result = capture(rec, captureMode)) {
+                        is Capture.Aborted -> break
+                        is Capture.RecorderFailed -> {
+                            recorderFailed = true
+                            break
+                        }
+                        is Capture.NoSpeech -> withContext(Dispatchers.Main) { onCommandTimeout(captureMode) }
+                        is Capture.Speech -> {
+                            val text = transcribe(result)
+                            if (text != null) {
+                                withContext(Dispatchers.Main) {
+                                    if (running && mode == captureMode) handleText(text, captureMode)
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                try {
+                    rec.stop()
+                } catch (ignored: Exception) {
+                }
+                try {
+                    rec.release()
+                } catch (ignored: Exception) {
+                }
+            }
+            if (recorderFailed) delay(500)
+        }
+    }
+
+    /**
+     * Records one utterance with an energy VAD.
+     * Mic is stopped again before returning, so nothing is recorded while Groq transcribes.
+     */
+    private suspend fun capture(rec: AudioRecord, captureMode: Mode): Capture {
         try {
-            if (recognizer == null) {
-                recognizer = SpeechRecognizer.createSpeechRecognizer(this).also {
-                    it.setRecognitionListener(listener)
-                }
-            }
-            val lang = Prefs.getLang(this)
-            val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang.recognizerTag)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-            }
-            recognizer?.startListening(i)
+            rec.startRecording()
         } catch (e: Exception) {
-            AgentLog.add("ERROR", "Recognizer start failed: ${e.javaClass.simpleName}: ${e.message}")
-            stopRecognizer()
-            scheduleRestart(1000)
+            AgentLog.add("ERROR", "startRecording failed: ${e.javaClass.simpleName}: ${e.message}")
+            return Capture.RecorderFailed
         }
-    }
-
-    private fun errorName(code: Int): String = when (code) {
-        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "NETWORK_TIMEOUT"
-        SpeechRecognizer.ERROR_NETWORK -> "NETWORK"
-        SpeechRecognizer.ERROR_AUDIO -> "AUDIO"
-        SpeechRecognizer.ERROR_SERVER -> "SERVER"
-        SpeechRecognizer.ERROR_CLIENT -> "CLIENT"
-        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "SPEECH_TIMEOUT"
-        SpeechRecognizer.ERROR_NO_MATCH -> "NO_MATCH"
-        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "RECOGNIZER_BUSY"
-        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "INSUFFICIENT_PERMISSIONS"
-        else -> "code $code"
-    }
-
-    private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onPartialResults(partialResults: Bundle?) {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-
-        override fun onError(error: Int) {
-            if (!running || mode == Mode.BUSY) return
-            if (error != SpeechRecognizer.ERROR_NO_MATCH && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-                AgentLog.add("MIC", "Recognizer error: ${errorName(error)}")
-            }
-            if (mode == Mode.COMMAND &&
-                (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
-            ) {
-                commandMisses++
-                if (commandMisses >= 2) {
-                    AgentLog.add("MIC", "No command heard - back to wake-word mode")
-                    mode = Mode.WAKE
-                }
-            }
-            when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleRestart(500)
-                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
-                    stopRecognizer()
-                    scheduleRestart(500)
-                }
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                    AgentLog.add("ERROR", "Microphone permission missing - stopping")
-                    stopSelf()
-                }
-                SpeechRecognizer.ERROR_CLIENT -> {
-                    stopRecognizer()
-                    scheduleRestart(700)
-                }
-                SpeechRecognizer.ERROR_NETWORK,
-                SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
-                SpeechRecognizer.ERROR_SERVER -> {
-                    stopRecognizer()
-                    scheduleRestart(1500)
-                }
-                else -> {
-                    stopRecognizer()
-                    scheduleRestart(1000)
-                }
-            }
+        if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            AgentLog.add("ERROR", "Microphone did not start recording (blocked by another app?)")
+            return Capture.RecorderFailed
         }
 
-        override fun onResults(results: Bundle?) {
-            if (!running || mode == Mode.BUSY) return
-            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: arrayListOf()
-            if (list.isEmpty()) {
-                scheduleRestart(500)
-                return
+        val silenceLimit = if (captureMode == Mode.COMMAND) COMMAND_SILENCE_MS else WAKE_SILENCE_MS
+        val maxMs = if (captureMode == Mode.COMMAND) COMMAND_MAX_MS else WAKE_MAX_MS
+        val frame = ShortArray(FRAME_SAMPLES)
+        val preRoll = ArrayDeque<ShortArray>()
+        val out = ByteArrayOutputStream(SAMPLE_RATE * 2 * 4)
+        var recording = false
+        var loudRun = 0
+        var speechMs = 0
+        var silentMs = 0
+        var totalMs = 0
+        var waitedMs = 0
+
+        try {
+            while (true) {
+                if (!currentCoroutineContext().isActive || !running || mode != captureMode) return Capture.Aborted
+
+                val n = rec.read(frame, 0, FRAME_SAMPLES)
+                if (n < 0) {
+                    AgentLog.add("ERROR", "AudioRecord.read error $n - reopening microphone")
+                    return Capture.RecorderFailed
+                }
+                if (n == 0) continue
+
+                var peak = 0
+                for (i in 0 until n) {
+                    val a = abs(frame[i].toInt())
+                    if (a > peak) peak = a
+                }
+                // Adaptive: in a noisy room the threshold rises above the noise; never below ~1100.
+                val threshold = max(VAD_THRESHOLD, min((noiseFloor * 2.5).toInt(), VAD_MAX_THRESHOLD))
+
+                if (!recording) {
+                    noiseFloor = if (noiseFloor <= 0.0) peak.toDouble() else noiseFloor * 0.97 + peak * 0.03
+                    preRoll.addLast(frame.copyOf(n))
+                    while (preRoll.size > PRE_ROLL_FRAMES) preRoll.removeFirst()
+
+                    loudRun = if (peak > threshold) loudRun + 1 else 0
+                    if (loudRun >= START_FRAMES) {
+                        recording = true
+                        out.reset()
+                        for (f in preRoll) writePcm(out, f, f.size)
+                        preRoll.clear()
+                        speechMs = loudRun * FRAME_MS
+                        totalMs = speechMs
+                        silentMs = 0
+                    } else if (captureMode == Mode.COMMAND) {
+                        waitedMs += FRAME_MS
+                        if (waitedMs >= COMMAND_WAIT_MS) return Capture.NoSpeech
+                    }
+                } else {
+                    writePcm(out, frame, n)
+                    totalMs += FRAME_MS
+                    if (peak > threshold) {
+                        speechMs += FRAME_MS
+                        silentMs = 0
+                    } else {
+                        silentMs += FRAME_MS
+                    }
+                    if (silentMs >= silenceLimit || totalMs >= maxMs) {
+                        if (speechMs < MIN_SPEECH_MS) {
+                            // Just a click / bump - keep waiting for real speech.
+                            recording = false
+                            loudRun = 0
+                            out.reset()
+                            continue
+                        }
+                        val durationMs = (out.size() / 2) * 1000 / SAMPLE_RATE
+                        return Capture.Speech(out.toByteArray(), durationMs)
+                    }
+                }
             }
-            AgentLog.add("MIC", "Heard: ${list.joinToString(" | ")}")
-            handleResults(list)
+        } finally {
+            try {
+                rec.stop()
+            } catch (ignored: Exception) {
+            }
         }
+        return Capture.Aborted
     }
 
-    // ------------------------------------------------------------------ wake word / commands
+    private fun writePcm(out: ByteArrayOutputStream, samples: ShortArray, count: Int) {
+        val b = ByteArray(count * 2)
+        for (i in 0 until count) {
+            val v = samples[i].toInt()
+            b[2 * i] = (v and 0xFF).toByte()
+            b[2 * i + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        out.write(b, 0, b.size)
+    }
+
+    /** Standard 44-byte PCM WAV header (16 kHz, mono, 16-bit, little-endian). */
+    private fun wavHeader(dataLen: Int): ByteArray {
+        val h = ByteArray(44)
+        fun putStr(off: Int, s: String) {
+            for (i in s.indices) h[off + i] = s[i].code.toByte()
+        }
+        fun putInt(off: Int, v: Int) {
+            h[off] = (v and 0xFF).toByte()
+            h[off + 1] = ((v shr 8) and 0xFF).toByte()
+            h[off + 2] = ((v shr 16) and 0xFF).toByte()
+            h[off + 3] = ((v shr 24) and 0xFF).toByte()
+        }
+        fun putShort(off: Int, v: Int) {
+            h[off] = (v and 0xFF).toByte()
+            h[off + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        putStr(0, "RIFF")
+        putInt(4, 36 + dataLen)
+        putStr(8, "WAVE")
+        putStr(12, "fmt ")
+        putInt(16, 16)                 // PCM fmt chunk size
+        putShort(20, 1)                // audio format = PCM
+        putShort(22, 1)                // channels = mono
+        putInt(24, SAMPLE_RATE)        // sample rate
+        putInt(28, SAMPLE_RATE * 2)    // byte rate = rate * channels * 2
+        putShort(32, 2)                // block align
+        putShort(34, 16)               // bits per sample
+        putStr(36, "data")
+        putInt(40, dataLen)
+        return h
+    }
+
+    // ------------------------------------------------------------------ Groq Whisper (IO thread)
+
+    /** Returns the transcript, or null on any failure (already logged, with back-off applied). */
+    private suspend fun transcribe(speech: Capture.Speech): String? {
+        val key = Prefs.getGroqKey(this)
+        if (key.isBlank()) {
+            AgentLog.add("ERROR", "Groq key (gsk_...) missing")
+            delay(5000)
+            return null
+        }
+        AgentLog.add("MIC", "Speech ${speech.durationMs} ms -> Groq Whisper...")
+        var tmp: File? = null
+        try {
+            val f = File.createTempFile("utt_", ".wav", cacheDir)
+            tmp = f
+            FileOutputStream(f).use { os ->
+                os.write(wavHeader(speech.pcm.size))
+                os.write(speech.pcm)
+            }
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", f.name, f.asRequestBody("audio/wav".toMediaType()))
+                .addFormDataPart("model", GROQ_MODEL)
+                .addFormDataPart("response_format", "json")
+                .addFormDataPart("temperature", "0")
+                .addFormDataPart("prompt", WHISPER_PROMPT)
+                .build()
+            val req = Request.Builder()
+                .url(GROQ_URL)
+                .header("Authorization", "Bearer $key")
+                .post(body)
+                .build()
+
+            val t0 = System.currentTimeMillis()
+            var retryAfterSec = 0
+            val (code, respBody) = http.newCall(req).execute().use { r ->
+                retryAfterSec = r.header("retry-after")?.toDoubleOrNull()?.toInt() ?: 0
+                r.code to (r.body?.string() ?: "")
+            }
+            val ms = System.currentTimeMillis() - t0
+
+            if (code != 200) {
+                var msg = ""
+                try {
+                    msg = JSONObject(respBody).optJSONObject("error")?.optString("message").orEmpty()
+                } catch (ignored: Exception) {
+                }
+                if (msg.isBlank()) msg = respBody.take(160)
+                when (code) {
+                    401, 403 -> {
+                        AgentLog.add("ERROR", "Groq HTTP $code: key rejected ($msg)")
+                        delay(5000)
+                    }
+                    429 -> {
+                        val wait = retryAfterSec.coerceIn(3, 60)
+                        AgentLog.add("ERROR", "Groq rate limit (HTTP 429) - pausing ${wait}s")
+                        delay(wait * 1000L)
+                    }
+                    else -> {
+                        AgentLog.add("ERROR", "Groq HTTP $code: $msg")
+                        delay(1500)
+                    }
+                }
+                return null
+            }
+
+            val text = JSONObject(respBody).optString("text").trim()
+            AgentLog.add("MIC", "Groq ${ms} ms")
+            return text
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: UnknownHostException) {
+            AgentLog.add("ERROR", "No internet (DNS failed for api.groq.com) - check Wi-Fi/VPN")
+            delay(3000)
+        } catch (e: SocketTimeoutException) {
+            AgentLog.add("ERROR", "Groq request timed out")
+            delay(1500)
+        } catch (e: IOException) {
+            AgentLog.add("ERROR", "Groq network error: ${e.javaClass.simpleName}: ${e.message}")
+            delay(2000)
+        } catch (e: Exception) {
+            AgentLog.add("ERROR", "Transcription failed: ${e.javaClass.simpleName}: ${e.message}")
+            delay(1000)
+        } finally {
+            try {
+                tmp?.delete()
+            } catch (ignored: Exception) {
+            }
+        }
+        return null
+    }
+
+    private fun isHallucination(text: String): Boolean {
+        val n = text.lowercase(Locale.ROOT).replace(Regex("[\\p{P}\\p{S}\\s]+"), " ").trim()
+        if (n.isEmpty()) return true
+        if (n in HALLUCINATIONS) return true
+        if (n.contains("субтитр") || n.contains("subtitle") || n.contains("amara org") ||
+            n.contains("thanks for watching") || n.contains("thank you for watching") ||
+            n.contains("спасибо за просмотр")
+        ) return true
+        // Whisper sometimes echoes the context prompt back on silence.
+        if (n.contains("o zbekcha va inglizcha") || n.contains("usdt sotib ol ovozli")) return true
+        return false
+    }
+
+    // ------------------------------------------------------------------ wake word / commands (main thread)
 
     /** Returns (index, wakeWord) of the earliest wake word in [text], case-insensitive. */
     private fun findWake(text: String): Pair<Int, String>? {
@@ -310,40 +591,45 @@ class AgentService : Service() {
 
     private fun commandAfter(text: String, idx: Int, word: String): String {
         val from = (idx + word.length).coerceAtMost(text.length)
-        return text.substring(from).trim(' ', ',', '.', '!', '?', ':', ';', '-')
+        return text.substring(from).trim(' ', ',', '.', '!', '?', ':', ';', '-', '—')
     }
 
-    private fun handleResults(list: List<String>) {
-        if (mode == Mode.WAKE) {
-            for (t in list) {
-                val f = findWake(t) ?: continue
-                val cmd = commandAfter(t, f.first, f.second)
-                AgentLog.add("MIC", "Wake word '${f.second}' detected")
-                if (cmd.length >= 3) runTask(cmd) else promptForCommand()
-                return
-            }
-            scheduleRestart(200)
-        } else if (mode == Mode.COMMAND) {
-            var cmd = list[0].trim()
+    private fun handleText(text: String, captureMode: Mode) {
+        if (isHallucination(text)) {
+            AgentLog.add("MIC", "Ignored Whisper silence artefact: \"$text\"")
+            return
+        }
+        AgentLog.add("MIC", "Heard: $text")
+
+        if (captureMode == Mode.WAKE) {
+            val f = findWake(text) ?: return
+            val cmd = commandAfter(text, f.first, f.second)
+            AgentLog.add("MIC", "Wake word '${f.second}' detected")
+            if (cmd.length >= 3) runTask(cmd) else promptForCommand()
+        } else if (captureMode == Mode.COMMAND) {
+            var cmd = text.trim()
             val f = findWake(cmd)
-            if (f != null && f.first == 0) cmd = commandAfter(cmd, f.first, f.second)
-            if (cmd.length < 2) {
-                scheduleRestart(300)
-            } else {
-                runTask(cmd)
-            }
+            if (f != null && f.first <= 1) cmd = commandAfter(cmd, f.first, f.second)
+            if (cmd.length >= 2) runTask(cmd)
+        }
+    }
+
+    private fun onCommandTimeout(captureMode: Mode) {
+        if (running && captureMode == Mode.COMMAND && mode == Mode.COMMAND) {
+            AgentLog.add("MIC", "No command heard - back to wake-word mode")
+            mode = Mode.WAKE // the running loop picks up the new mode on its next capture
         }
     }
 
     private fun promptForCommand() {
         mode = Mode.BUSY
-        stopRecognizer()
+        stopListening() // release the mic so it doesn't hear the TTS prompt
         val lang = Prefs.getLang(this)
         TtsManager.speak(lang.listening(), lang) {
             main.postDelayed({
                 if (running) {
                     mode = Mode.COMMAND
-                    commandMisses = 0
+                    AgentLog.add("MIC", "Waiting for command...")
                     startListening()
                 }
             }, 300)
@@ -352,7 +638,7 @@ class AgentService : Service() {
 
     private fun runTask(command: String) {
         mode = Mode.BUSY
-        stopRecognizer()
+        stopListening()
         val lang = Prefs.getLang(this)
         AgentLog.add("MIC", "Command: $command")
         job?.cancel()
@@ -373,7 +659,7 @@ class AgentService : Service() {
         if (!running) return
         mode = Mode.WAKE
         AgentLog.add("MIC", "Back to wake-word listening")
-        main.postDelayed({ startListening() }, 500)
+        main.postDelayed({ startListening() }, 400)
     }
 
     // ------------------------------------------------------------------ teardown
@@ -381,13 +667,17 @@ class AgentService : Service() {
     override fun onDestroy() {
         running = false
         job?.cancel()
+        listenJob?.cancel()
         scope.cancel()
         main.removeCallbacksAndMessages(null)
-        stopRecognizer()
         TtsManager.stop()
         try {
             wakeLock?.let { if (it.isHeld) it.release() }
-        } catch (_: Exception) {
+        } catch (ignored: Exception) {
+        }
+        try {
+            http.connectionPool.evictAll()
+        } catch (ignored: Exception) {
         }
         AgentLog.add("SYS", "Listening service stopped")
         super.onDestroy()
