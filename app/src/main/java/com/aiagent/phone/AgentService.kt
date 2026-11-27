@@ -168,10 +168,10 @@ class AgentService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (!geminiKey().startsWith("AIza")) {
+        if (geminiKey().isBlank()) {
             AgentLog.add(
                 "ERROR",
-                "Gemini API key (AIza...) not found. Paste your Google Gemini key into the API key field."
+                "Gemini API key not found. Paste your Google AI Studio key (AIza... or AQ....) into the API key field."
             )
             stopSelf()
             return START_NOT_STICKY
@@ -187,12 +187,13 @@ class AgentService : Service() {
 
     /**
      * The single Gemini key used for both ears and brain.
-     * Tolerates a comma-separated field by picking the entry that starts with "AIza".
+     * Accepts any non-blank key (AIza..., AQ...., or any future prefix); only Groq (gsk_) and
+     * Anthropic (sk-ant-) keys are skipped. Tolerates a comma-separated field.
      */
     private fun geminiKey(): String {
         val raw = Prefs.getBrainKey(this).ifBlank { Prefs.getApiKey(this) }
         val parts = raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-        return parts.firstOrNull { it.startsWith("AIza") } ?: parts.firstOrNull().orEmpty()
+        return parts.firstOrNull { !it.startsWith("gsk_") && !it.startsWith("sk-ant-") }.orEmpty()
     }
 
     // ------------------------------------------------------------------ foreground
@@ -547,7 +548,7 @@ class AgentService : Service() {
     private suspend fun transcribeWithGemini(wavFile: File): String? {
         val key = geminiKey()
         if (key.isBlank()) {
-            AgentLog.add("ERROR", "Gemini API key (AIza...) missing")
+            AgentLog.add("ERROR", "Gemini API key missing")
             delay(5000)
             return null
         }
