@@ -19,6 +19,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Base64
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,12 +31,16 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -45,6 +50,8 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -53,8 +60,8 @@ import kotlin.math.min
  * Foreground service: continuous wake-word listening + autonomous task execution.
  *
  * Ears = AudioRecord (16 kHz mono PCM16) + energy VAD on Dispatchers.IO.
- * Each detected utterance is wrapped in a WAV header and transcribed by Groq Whisper
- * (whisper-large-v3-turbo, no fixed language -> Uzbek/English/Russian code-switching works).
+ * Each detected utterance is written to a temporary WAV file in cacheDir and transcribed by
+ * Google Gemini 2.5 Flash (inline audio, no fixed language -> Uzbek/English/Russian code-switching works).
  * The microphone is released whenever the agent is BUSY (speaking or acting) so it never hears itself.
  */
 class AgentService : Service() {
@@ -81,18 +88,22 @@ class AgentService : Service() {
         private const val COMMAND_MAX_MS = 12000
         private const val COMMAND_WAIT_MS = 8000                    // no speech in COMMAND mode -> back to WAKE
 
-        // ---- Groq Whisper ----
-        private const val GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-        private const val GROQ_MODEL = "whisper-large-v3-turbo"
-        private const val WHISPER_PROMPT =
-            "O'zbekcha va inglizcha buyruqlar: Yordamchi, Agent, Telegramga kir, USDT sotib ol, ovozli xabar yubor."
+        // ---- Google Gemini (speech-to-text) ----
+        private const val GEMINI_MODEL = "gemini-2.5-flash"
+        private const val GEMINI_BASE_URL =
+            "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent"
+        private const val GEMINI_PROMPT =
+            "Transcribe this voice command accurately into plain text. The user speaks Uzbek, English, or Russian " +
+                "(often mixing Uzbek and English). Return ONLY the exact spoken words, nothing else. " +
+                "If it is just background noise or silence, return an empty string."
 
-        /** Exact (normalized) phrases Whisper invents on silence/noise. */
+        /** Exact (normalized) phrases speech models invent on silence/noise. */
         private val HALLUCINATIONS = setOf(
             "thank you", "thank you very much", "thanks", "thanks for watching", "thank you for watching",
             "you", "bye", "bye bye", "okay", "music", "applause", "subscribe", "like and subscribe",
+            "silence", "empty string", "no speech", "background noise", "noise",
             "спасибо", "спасибо за внимание", "спасибо за просмотр", "продолжение следует", "до свидания",
-            "музыка", "rahmat", "katta rahmat"
+            "музыка", "тишина", "rahmat", "katta rahmat"
         )
 
         @Volatile
@@ -132,8 +143,8 @@ class AgentService : Service() {
 
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(45, TimeUnit.SECONDS)
         .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -157,10 +168,10 @@ class AgentService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (Prefs.getGroqKey(this).isBlank()) {
+        if (!geminiKey().startsWith("AIza")) {
             AgentLog.add(
                 "ERROR",
-                "Groq key (gsk_...) not found. Paste it into the API key field together with the brain key, separated by a comma."
+                "Gemini API key (AIza...) not found. Paste your Google Gemini key into the API key field."
             )
             stopSelf()
             return START_NOT_STICKY
@@ -168,10 +179,20 @@ class AgentService : Service() {
 
         running = true
         acquireWakeLock()
-        AgentLog.add("SYS", "Listening service started (Groq $GROQ_MODEL)")
+        AgentLog.add("SYS", "Listening service started (Gemini $GEMINI_MODEL)")
         mode = Mode.WAKE
         startListening()
         return START_NOT_STICKY
+    }
+
+    /**
+     * The single Gemini key used for both ears and brain.
+     * Tolerates a comma-separated field by picking the entry that starts with "AIza".
+     */
+    private fun geminiKey(): String {
+        val raw = Prefs.getBrainKey(this).ifBlank { Prefs.getApiKey(this) }
+        val parts = raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        return parts.firstOrNull { it.startsWith("AIza") } ?: parts.firstOrNull().orEmpty()
     }
 
     // ------------------------------------------------------------------ foreground
@@ -306,8 +327,8 @@ class AgentService : Service() {
                         }
                         is Capture.NoSpeech -> withContext(Dispatchers.Main) { onCommandTimeout(captureMode) }
                         is Capture.Speech -> {
-                            val text = transcribe(result)
-                            if (text != null) {
+                            val text = transcribeSpeech(result)
+                            if (!text.isNullOrBlank()) {
                                 withContext(Dispatchers.Main) {
                                     if (running && mode == captureMode) handleText(text, captureMode)
                                 }
@@ -331,7 +352,7 @@ class AgentService : Service() {
 
     /**
      * Records one utterance with an energy VAD.
-     * Mic is stopped again before returning, so nothing is recorded while Groq transcribes.
+     * Mic is stopped again before returning, so nothing is recorded while Gemini transcribes.
      */
     private suspend fun capture(rec: AudioRecord, captureMode: Mode): Capture {
         try {
@@ -422,6 +443,7 @@ class AgentService : Service() {
             } catch (ignored: Exception) {
             }
         }
+        @Suppress("UNREACHABLE_CODE")
         return Capture.Aborted
     }
 
@@ -467,42 +489,94 @@ class AgentService : Service() {
         return h
     }
 
-    // ------------------------------------------------------------------ Groq Whisper (IO thread)
+    // ------------------------------------------------------------------ Gemini speech-to-text (IO thread)
 
-    /** Returns the transcript, or null on any failure (already logged, with back-off applied). */
-    private suspend fun transcribe(speech: Capture.Speech): String? {
-        val key = Prefs.getGroqKey(this)
-        if (key.isBlank()) {
-            AgentLog.add("ERROR", "Groq key (gsk_...) missing")
-            delay(5000)
-            return null
+    /** Suspends until the OkHttp call completes; cancelling the coroutine cancels the HTTP call. */
+    private suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
+        cont.invokeOnCancellation {
+            try {
+                cancel()
+            } catch (ignored: Throwable) {
+            }
         }
-        AgentLog.add("MIC", "Speech ${speech.durationMs} ms -> Groq Whisper...")
-        var tmp: File? = null
+        enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWithException(e)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                cont.resume(response)
+            }
+        })
+    }
+
+    /**
+     * Writes the utterance to a temporary .wav file in cacheDir, transcribes it with Gemini,
+     * and always deletes the file afterwards.
+     * Returns the transcript ("" for silence), or null on failure (already logged, with back-off applied).
+     */
+    private suspend fun transcribeSpeech(speech: Capture.Speech): String? {
+        var wav: File? = null
         try {
             val f = File.createTempFile("utt_", ".wav", cacheDir)
-            tmp = f
+            wav = f
             FileOutputStream(f).use { os ->
                 os.write(wavHeader(speech.pcm.size))
                 os.write(speech.pcm)
             }
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("file", f.name, f.asRequestBody("audio/wav".toMediaType()))
-                .addFormDataPart("model", GROQ_MODEL)
-                .addFormDataPart("response_format", "json")
-                .addFormDataPart("temperature", "0")
-                .addFormDataPart("prompt", WHISPER_PROMPT)
-                .build()
+            AgentLog.add("MIC", "Speech ${speech.durationMs} ms -> Gemini...")
+            return transcribeWithGemini(f)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AgentLog.add("ERROR", "Could not prepare audio: ${e.javaClass.simpleName}: ${e.message}")
+            delay(1000)
+            return null
+        } finally {
+            try {
+                wav?.delete()
+            } catch (ignored: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Sends the WAV file to Gemini 2.5 Flash as inline base64 audio.
+     * Returns the transcript (possibly empty for silence/noise), or null on any failure.
+     */
+    private suspend fun transcribeWithGemini(wavFile: File): String? {
+        val key = geminiKey()
+        if (key.isBlank()) {
+            AgentLog.add("ERROR", "Gemini API key (AIza...) missing")
+            delay(5000)
+            return null
+        }
+        try {
+            val base64Audio = Base64.encodeToString(wavFile.readBytes(), Base64.NO_WRAP)
+
+            val inlineData = JSONObject()
+                .put("mimeType", "audio/wav")
+                .put("data", base64Audio)
+            val parts = JSONArray()
+                .put(JSONObject().put("inlineData", inlineData))
+                .put(JSONObject().put("text", GEMINI_PROMPT))
+            val contents = JSONArray()
+                .put(JSONObject().put("role", "user").put("parts", parts))
+            val generationConfig = JSONObject()
+                .put("temperature", 0)
+                .put("thinkingConfig", JSONObject().put("thinkingBudget", 0)) // no "thinking" -> faster STT
+            val payload = JSONObject()
+                .put("contents", contents)
+                .put("generationConfig", generationConfig)
+
             val req = Request.Builder()
-                .url(GROQ_URL)
-                .header("Authorization", "Bearer $key")
-                .post(body)
+                .url("$GEMINI_BASE_URL?key=$key")
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
 
             val t0 = System.currentTimeMillis()
             var retryAfterSec = 0
-            val (code, respBody) = http.newCall(req).execute().use { r ->
+            val (code, respBody) = http.newCall(req).await().use { r ->
                 retryAfterSec = r.header("retry-after")?.toDoubleOrNull()?.toInt() ?: 0
                 r.code to (r.body?.string() ?: "")
             }
@@ -516,45 +590,51 @@ class AgentService : Service() {
                 }
                 if (msg.isBlank()) msg = respBody.take(160)
                 when (code) {
-                    401, 403 -> {
-                        AgentLog.add("ERROR", "Groq HTTP $code: key rejected ($msg)")
+                    400, 401, 403 -> {
+                        AgentLog.add("ERROR", "Gemini HTTP $code: request/key rejected ($msg)")
                         delay(5000)
                     }
                     429 -> {
-                        val wait = retryAfterSec.coerceIn(3, 60)
-                        AgentLog.add("ERROR", "Groq rate limit (HTTP 429) - pausing ${wait}s")
+                        val wait = retryAfterSec.coerceIn(5, 60)
+                        AgentLog.add("ERROR", "Gemini rate limit (HTTP 429) - pausing ${wait}s")
                         delay(wait * 1000L)
                     }
                     else -> {
-                        AgentLog.add("ERROR", "Groq HTTP $code: $msg")
+                        AgentLog.add("ERROR", "Gemini HTTP $code: $msg")
                         delay(1500)
                     }
                 }
                 return null
             }
 
-            val text = JSONObject(respBody).optString("text").trim()
-            AgentLog.add("MIC", "Groq ${ms} ms")
+            // candidates[0].content.parts[0].text  (missing when the reply is empty or blocked -> treated as silence)
+            val text = JSONObject(respBody)
+                .optJSONArray("candidates")
+                ?.optJSONObject(0)
+                ?.optJSONObject("content")
+                ?.optJSONArray("parts")
+                ?.optJSONObject(0)
+                ?.optString("text")
+                .orEmpty()
+                .trim()
+                .trim('"')
+                .trim()
+            AgentLog.add("MIC", "Gemini ${ms} ms")
             return text
         } catch (e: CancellationException) {
             throw e
         } catch (e: UnknownHostException) {
-            AgentLog.add("ERROR", "No internet (DNS failed for api.groq.com) - check Wi-Fi/VPN")
+            AgentLog.add("ERROR", "No internet (DNS failed for generativelanguage.googleapis.com) - check Wi-Fi/VPN")
             delay(3000)
         } catch (e: SocketTimeoutException) {
-            AgentLog.add("ERROR", "Groq request timed out")
+            AgentLog.add("ERROR", "Gemini request timed out")
             delay(1500)
         } catch (e: IOException) {
-            AgentLog.add("ERROR", "Groq network error: ${e.javaClass.simpleName}: ${e.message}")
+            AgentLog.add("ERROR", "Gemini network error: ${e.javaClass.simpleName}: ${e.message}")
             delay(2000)
         } catch (e: Exception) {
             AgentLog.add("ERROR", "Transcription failed: ${e.javaClass.simpleName}: ${e.message}")
             delay(1000)
-        } finally {
-            try {
-                tmp?.delete()
-            } catch (ignored: Exception) {
-            }
         }
         return null
     }
@@ -567,8 +647,8 @@ class AgentService : Service() {
             n.contains("thanks for watching") || n.contains("thank you for watching") ||
             n.contains("спасибо за просмотр")
         ) return true
-        // Whisper sometimes echoes the context prompt back on silence.
-        if (n.contains("o zbekcha va inglizcha") || n.contains("usdt sotib ol ovozli")) return true
+        // The model sometimes echoes the instruction back instead of a transcript.
+        if (n.contains("transcribe this voice") || n.contains("return only the exact spoken words")) return true
         return false
     }
 
@@ -596,7 +676,7 @@ class AgentService : Service() {
 
     private fun handleText(text: String, captureMode: Mode) {
         if (isHallucination(text)) {
-            AgentLog.add("MIC", "Ignored Whisper silence artefact: \"$text\"")
+            AgentLog.add("MIC", "Ignored speech-model silence artefact: \"$text\"")
             return
         }
         AgentLog.add("MIC", "Heard: $text")
